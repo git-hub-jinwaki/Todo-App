@@ -32,7 +32,8 @@ import {
   CheckCircle,
   ExternalLink,
   Sparkles,
-  ArrowRight
+  ArrowRight,
+  LogOut
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI, Type } from "@google/genai";
@@ -263,9 +264,19 @@ function AppContent() {
 
   const handleLogin = async () => {
     try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (error) {
-      console.error('Login error:', error);
+      console.log('Starting Google login...');
+      const result = await signInWithPopup(auth, googleProvider);
+      console.log('Login successful:', result.user.email);
+    } catch (error: any) {
+      console.error('Login error code:', error.code);
+      console.error('Login error message:', error.message);
+      if (error.code === 'auth/popup-closed-by-user') {
+        alert('ログイン画面が閉じられました。再度お試しください。');
+      } else if (error.code === 'auth/unauthorized-domain') {
+        alert('このドメインはFirebaseで許可されていません。Firebaseコンソールの「承認済みドメイン」に現在のドメインを追加してください。');
+      } else {
+        alert('ログイン中にエラーが発生しました: ' + error.message);
+      }
     }
   };
 
@@ -703,8 +714,8 @@ function AppContent() {
       </AnimatePresence>
 
       {/* Navigation Sidebar (Desktop) */}
-      <nav className="hidden md:flex z-50 w-64 h-screen sticky top-0 flex-shrink-0">
-        <div className="h-full glass-card border-r border-white/40 flex flex-col p-6">
+      <nav className="hidden md:flex z-50 w-64 h-screen fixed left-0 top-0 flex-shrink-0">
+        <div className="h-full w-full glass-card border-r border-white/40 flex flex-col p-6">
           {/* Logo Section */}
           <div className="flex items-center gap-3 mb-12">
             <div className="w-10 h-10 coral-gradient rounded-xl flex items-center justify-center shadow-lg flex-shrink-0">
@@ -725,7 +736,7 @@ function AppContent() {
 
           <div className="mt-auto pt-8 border-t border-brand-indigo/5">
             <div className="flex items-center gap-3 px-4 py-3 bg-brand-indigo/5 rounded-2xl mb-4">
-              <div className="w-10 h-10 rounded-full bg-brand-indigo text-white flex items-center justify-center font-bold">
+              <div className="w-10 h-10 rounded-full bg-brand-indigo text-white flex items-center justify-center font-bold flex-shrink-0">
                 {user.displayName?.[0] || 'U'}
               </div>
               <div className="flex-1 min-w-0">
@@ -737,7 +748,7 @@ function AppContent() {
               onClick={handleLogout}
               className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold text-gray-400 hover:text-brand-coral hover:bg-brand-coral/5 rounded-2xl transition-all"
             >
-              <Settings size={20} />
+              <LogOut size={20} />
               ログアウト
             </button>
           </div>
@@ -745,7 +756,7 @@ function AppContent() {
       </nav>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 md:ml-64">
         {/* Mobile Header */}
         <header className="md:hidden sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-brand-indigo/5 px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
