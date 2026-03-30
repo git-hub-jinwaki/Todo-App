@@ -1,0 +1,107 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: minutes
+    // Document ID: {minuteId}
+    // Fields:
+    //   - title: string (required) - Title of the meeting
+    //   - content: string (optional) - Original content or preview
+    //   - summary: string (required) - AI generated summary
+    //   - format: string (optional) - Format used for generation
+    //   - createdAt: timestamp (required) - Creation timestamp
+    //   - uid: string (required) - User ID who owns this minute
+    //
+    // Collection: tasks
+    // Document ID: {taskId}
+    // Fields:
+    //   - minuteId: string (required) - Reference to the minute document ID
+    //   - text: string (required) - Task description
+    //   - assignee: string (optional) - Person assigned to the task
+    //   - dueDate: string (optional) - Due date for the task
+    //   - status: string (required, enum: ['pending', 'completed']) - Current status of the task
+    //   - createdAt: timestamp (required) - Creation timestamp
+    //   - uid: string (required) - User ID who owns this task
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+             request.resource.data[field].size() >= minLen &&
+             request.resource.data[field].size() <= maxLen;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidMinute(data) {
+      return hasRequiredFields(['title', 'summary', 'uid', 'createdAt']) &&
+             hasOnlyAllowedFields(['title', 'content', 'summary', 'format', 'uid', 'createdAt']) &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             data.summary is string && data.summary.size() > 0 && data.summary.size() < 100000 &&
+             data.uid == request.auth.uid &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidTask(data) {
+      return hasRequiredFields(['minuteId', 'text', 'status', 'uid', 'createdAt']) &&
+             hasOnlyAllowedFields(['minuteId', 'text', 'assignee', 'dueDate', 'status', 'uid', 'createdAt']) &&
+             data.minuteId is string &&
+             data.text is string && data.text.size() > 0 && data.text.size() < 2000 &&
+             data.status in ['pending', 'completed'] &&
+             data.uid == request.auth.uid &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Match Rules
+    // ===============================================================
+    match /minutes/{minuteId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidMinute(request.resource.data);
+      allow update: if isDocOwner() && isValidMinute(request.resource.data) && uidNotModified();
+      allow delete: if isDocOwner();
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidTask(request.resource.data);
+      allow update: if isDocOwner() && isValidTask(request.resource.data) && uidNotModified();
+      allow delete: if isDocOwner();
+    }
+  }
+}

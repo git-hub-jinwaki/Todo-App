@@ -42,8 +42,102 @@ import { ja } from 'date-fns/locale';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
+import { auth, db, googleProvider, signInWithPopup, signOut } from './firebase';
+import { 
+  collection, 
+  addDoc, 
+  query, 
+  where, 
+  onSnapshot, 
+  orderBy, 
+  updateDoc, 
+  doc, 
+  deleteDoc, 
+  Timestamp,
+  getDocFromServer
+} from 'firebase/firestore';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: any;
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center">
+            <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-6">
+              <X size={32} />
+            </div>
+            <h1 className="text-2xl font-bold text-gray-900 mb-4">エラーが発生しました</h1>
+            <p className="text-gray-600 mb-8">
+              申し訳ありません。アプリケーションの実行中に予期しないエラーが発生しました。
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="w-full bg-brand-indigo text-white py-3 rounded-xl font-bold hover:bg-opacity-90 transition-all"
+            >
+              ページを再読み込み
+            </button>
+            {process.env.NODE_ENV !== 'production' && (
+              <pre className="mt-8 p-4 bg-gray-100 rounded-lg text-left text-xs overflow-auto max-h-40">
+                {this.state.error?.message}
+              </pre>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -51,25 +145,38 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 type Tab = 'home' | 'create' | 'tasks' | 'knowledge' | 'all-minutes' | 'all-tasks';
 
 interface Minute {
-  id: number;
+  id: string;
   title: string;
   content: string;
   summary: string;
   format: string;
-  created_at: string;
+  createdAt: Timestamp;
+  uid: string;
 }
 
 interface Task {
-  id: number;
-  minute_id: number;
-  task_text: string;
+  id: string;
+  minuteId: string;
+  text: string;
   assignee: string;
-  due_date: string;
+  dueDate: string;
   status: 'pending' | 'completed';
-  minute_title?: string;
+  createdAt: Timestamp;
+  uid: string;
+  minuteTitle?: string;
 }
 
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+function AppContent() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('home');
   const [taskFilter, setTaskFilter] = useState<'all' | 'pending' | 'completed'>('all');
   const [isUploading, setIsUploading] = useState(false);
@@ -93,32 +200,81 @@ export default function App() {
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
-    fetchMinutes();
-    fetchTasks();
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const qMinutes = query(
+      collection(db, 'minutes'),
+      where('uid', '==', user.uid),
+      orderBy('createdAt', 'desc')
+    );
+
+    const unsubscribeMinutes = onSnapshot(qMinutes, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Minute));
+      setMinutes(docs);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'minutes');
+    });
+
+    const qTasks = query(
+      collection(db, 'tasks'),
+      where('uid', '==', user.uid),
+      orderBy('createdAt', 'desc')
+    );
+
+    const unsubscribeTasks = onSnapshot(qTasks, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Task));
+      setTasks(docs);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'tasks');
+    });
+
+    return () => {
+      unsubscribeMinutes();
+      unsubscribeTasks();
+    };
+  }, [user]);
+
+  useEffect(() => {
+    async function testConnection() {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if(error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration. ");
+        }
+      }
+    }
+    testConnection();
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
   }, []);
 
-  const fetchMinutes = async () => {
+  const handleLogin = async () => {
     try {
-      const res = await fetch('/api/minutes');
-      const data = await res.json();
-      setMinutes(Array.isArray(data) ? data : []);
+      await signInWithPopup(auth, googleProvider);
     } catch (error) {
-      console.error('Error fetching minutes:', error);
-      setMinutes([]);
+      console.error('Login error:', error);
     }
   };
 
-  const fetchTasks = async () => {
+  const handleLogout = async () => {
     try {
-      const res = await fetch('/api/tasks');
-      const data = await res.json();
-      setTasks(Array.isArray(data) ? data : []);
+      await signOut(auth);
+      setActiveTab('home');
     } catch (error) {
-      console.error('Error fetching tasks:', error);
-      setTasks([]);
+      console.error('Logout error:', error);
     }
   };
 
@@ -253,24 +409,35 @@ export default function App() {
       const result = JSON.parse(response.text || '{}');
       setGeneratedResult(result);
 
-      // Save to DB
-      await fetch('/api/minutes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: result.title,
-          content: content.substring(0, 1000), // Store preview
-          summary: result.summary,
-          format: 'unified',
-          tasks: result.tasks
-        })
+      if (!user) throw new Error('User not authenticated');
+
+      // Save to Firestore
+      const minuteRef = await addDoc(collection(db, 'minutes'), {
+        title: result.title,
+        content: content.substring(0, 1000), // Store preview
+        summary: result.summary,
+        format: 'unified',
+        createdAt: Timestamp.now(),
+        uid: user.uid
       });
+
+      if (result.tasks && Array.isArray(result.tasks)) {
+        for (const task of result.tasks) {
+          await addDoc(collection(db, 'tasks'), {
+            minuteId: minuteRef.id,
+            text: task.text,
+            assignee: task.assignee,
+            dueDate: task.dueDate,
+            status: 'pending',
+            createdAt: Timestamp.now(),
+            uid: user.uid
+          });
+        }
+      }
 
       setUploadProgress(100);
       setTimeout(() => {
         setIsUploading(false);
-        fetchMinutes();
-        fetchTasks();
       }, 500);
 
     } catch (error) {
@@ -279,14 +446,15 @@ export default function App() {
     }
   };
 
-  const toggleTaskStatus = async (id: number, currentStatus: string) => {
+  const toggleTaskStatus = async (id: string, currentStatus: string) => {
     const newStatus = currentStatus === 'pending' ? 'completed' : 'pending';
-    await fetch(`/api/tasks/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: newStatus })
-    });
-    fetchTasks();
+    try {
+      await updateDoc(doc(db, 'tasks', id), {
+        status: newStatus
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `tasks/${id}`);
+    }
   };
 
   const startRecording = async () => {
@@ -352,22 +520,20 @@ export default function App() {
     setManualText('');
   };
 
-  const addTaskToMinute = async (minuteId: number, taskText: string) => {
-    if (!taskText.trim()) return;
+  const addTaskToMinute = async (minuteId: string, taskText: string, taskData?: { assignee?: string, dueDate?: string }) => {
+    if (!taskText.trim() || !user) return;
     try {
-      await fetch('/api/tasks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          minute_id: minuteId,
-          task_text: taskText,
-          assignee: '自分',
-          due_date: format(new Date(), 'yyyy-MM-dd')
-        })
+      await addDoc(collection(db, 'tasks'), {
+        minuteId: minuteId,
+        text: taskText,
+        assignee: taskData?.assignee || '自分',
+        dueDate: taskData?.dueDate || format(new Date(), 'yyyy-MM-dd'),
+        status: 'pending',
+        createdAt: Timestamp.now(),
+        uid: user.uid
       });
-      fetchTasks();
     } catch (error) {
-      console.error('Error adding task:', error);
+      handleFirestoreError(error, OperationType.CREATE, 'tasks');
     }
   };
 
@@ -397,7 +563,7 @@ export default function App() {
       const extractedTasks = JSON.parse(response.text || '[]');
       if (Array.isArray(extractedTasks)) {
         for (const task of extractedTasks) {
-          await addTaskToMinute(minute.id, task.text);
+          await addTaskToMinute(minute.id, task.text, { assignee: task.assignee, dueDate: task.dueDate });
         }
         alert(`${extractedTasks.length}件のタスクを抽出・追加しました。`);
       }
@@ -445,6 +611,48 @@ export default function App() {
       setIsChatLoading(false);
     }
   };
+
+  const handleSearch = () => {
+    if (!searchQuery.trim()) return minutes;
+    const q = searchQuery.toLowerCase();
+    return minutes.filter(m => 
+      m.title.toLowerCase().includes(q) || 
+      m.summary.toLowerCase().includes(q) || 
+      m.content.toLowerCase().includes(q)
+    );
+  };
+
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <Loader2 className="animate-spin text-brand-indigo" size={48} />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+        <div className="max-w-md w-full bg-white rounded-3xl shadow-2xl p-12 text-center border border-brand-indigo/5">
+          <div className="w-20 h-20 coral-gradient rounded-2xl flex items-center justify-center text-white mx-auto mb-8 shadow-xl">
+            <Sparkles size={40} />
+          </div>
+          <h1 className="text-3xl font-black text-brand-indigo mb-4">AI議事録管理</h1>
+          <p className="text-gray-500 mb-10 font-medium">
+            会議の音声をAIが分析し、<br />
+            完璧な議事録を自動生成します。
+          </p>
+          <button
+            onClick={handleLogin}
+            className="w-full bg-brand-indigo text-white py-4 rounded-2xl font-bold flex items-center justify-center gap-3 hover:bg-opacity-90 transition-all shadow-xl shadow-brand-indigo/20"
+          >
+            <User size={20} />
+            Googleでログイン
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row relative bg-brand-cream/50">
@@ -513,6 +721,25 @@ export default function App() {
             <NavButton active={activeTab === 'create'} onClick={() => setActiveTab('create')} icon={<Plus size={20} />} label="新規作成" />
             <NavButton active={activeTab === 'tasks'} onClick={() => setActiveTab('tasks')} icon={<CheckCircle2 size={20} />} label="タスク管理" />
             <NavButton active={activeTab === 'knowledge'} onClick={() => setActiveTab('knowledge')} icon={<Search size={20} />} label="ナレッジ検索" />
+          </div>
+
+          <div className="mt-auto pt-8 border-t border-brand-indigo/5">
+            <div className="flex items-center gap-3 px-4 py-3 bg-brand-indigo/5 rounded-2xl mb-4">
+              <div className="w-10 h-10 rounded-full bg-brand-indigo text-white flex items-center justify-center font-bold">
+                {user.displayName?.[0] || 'U'}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold text-brand-indigo truncate">{user.displayName}</p>
+                <p className="text-[10px] text-gray-400 truncate">{user.email}</p>
+              </div>
+            </div>
+            <button 
+              onClick={handleLogout}
+              className="w-full flex items-center gap-3 px-4 py-3 text-sm font-bold text-gray-400 hover:text-brand-coral hover:bg-brand-coral/5 rounded-2xl transition-all"
+            >
+              <Settings size={20} />
+              ログアウト
+            </button>
           </div>
         </div>
       </nav>
@@ -636,7 +863,7 @@ export default function App() {
                               {minute.format}
                             </span>
                             <span className="text-[10px] font-mono opacity-40">
-                              {format(new Date(minute.created_at), 'yyyy.MM.dd')}
+                              {minute.createdAt?.toDate ? format(minute.createdAt.toDate(), 'yyyy.MM.dd') : '----.--.--'}
                             </span>
                           </div>
                           <h3 className="font-bold text-brand-indigo truncate">{minute.title}</h3>
@@ -675,8 +902,8 @@ export default function App() {
                           <div className="w-2.5 h-2.5 rounded-sm bg-brand-coral opacity-0 group-hover:opacity-20" />
                         </button>
                         <div className="flex-1 min-w-0">
-                          <p className="text-sm font-bold text-brand-indigo truncate">{task.task_text}</p>
-                          <p className="text-[10px] opacity-40 mt-0.5">{task.assignee} • {task.due_date}</p>
+                          <p className="text-sm font-bold text-brand-indigo truncate">{task.text}</p>
+                          <p className="text-[10px] opacity-40 mt-0.5">{task.assignee} • {task.dueDate}</p>
                         </div>
                         <div className="w-2 h-2 rounded-full bg-brand-coral" />
                       </div>
@@ -776,7 +1003,9 @@ export default function App() {
                       <button 
                         onClick={() => {
                           copyToClipboard(`${window.location.origin}/minutes/${generatedResult.title}`);
-                          alert('共有リンクをコピーしました');
+                          alert('保存が完了し、共有リンクをコピーしました');
+                          setGeneratedResult(null);
+                          setActiveTab('home');
                         }}
                         className="coral-gradient text-white px-8 py-2.5 rounded-2xl text-sm font-bold shadow-xl shadow-brand-coral/20 hover:scale-105 transition-transform flex items-center gap-2"
                       >
@@ -891,26 +1120,42 @@ export default function App() {
               className="max-w-4xl"
             >
               <div className="flex items-center justify-between mb-8">
-                <div className="flex gap-2">
-                  <button 
-                    onClick={() => setTaskFilter('all')}
-                    className={cn("px-4 py-2 rounded-xl text-sm font-bold transition-all", taskFilter === 'all' ? "bg-white shadow-sm" : "glass-card opacity-50")}
-                  >
-                    全て
-                  </button>
-                  <button 
-                    onClick={() => setTaskFilter('pending')}
-                    className={cn("px-4 py-2 rounded-xl text-sm font-bold transition-all", taskFilter === 'pending' ? "bg-white shadow-sm" : "glass-card opacity-50")}
-                  >
-                    未完了
-                  </button>
-                  <button 
-                    onClick={() => setTaskFilter('completed')}
-                    className={cn("px-4 py-2 rounded-xl text-sm font-bold transition-all", taskFilter === 'completed' ? "bg-white shadow-sm" : "glass-card opacity-50")}
-                  >
-                    完了済み
-                  </button>
+                <button 
+                  onClick={() => setActiveTab('home')}
+                  className="flex items-center gap-2 text-sm font-bold text-brand-indigo opacity-50 hover:opacity-100 transition-opacity"
+                >
+                  <ChevronRight size={16} className="rotate-180" /> ホームに戻る
+                </button>
+                <div className="relative w-64">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-brand-indigo/30" size={16} />
+                  <input 
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="タスクを検索..."
+                    className="w-full bg-white/50 border border-brand-indigo/10 rounded-xl py-2 pl-10 pr-4 text-xs focus:outline-none focus:ring-2 focus:ring-brand-coral/50 transition-all"
+                  />
                 </div>
+              </div>
+              <div className="flex gap-2 mb-8">
+                <button 
+                  onClick={() => setTaskFilter('all')}
+                  className={cn("px-4 py-2 rounded-xl text-sm font-bold transition-all", taskFilter === 'all' ? "bg-white shadow-sm" : "glass-card opacity-50")}
+                >
+                  全て
+                </button>
+                <button 
+                  onClick={() => setTaskFilter('pending')}
+                  className={cn("px-4 py-2 rounded-xl text-sm font-bold transition-all", taskFilter === 'pending' ? "bg-white shadow-sm" : "glass-card opacity-50")}
+                >
+                  未完了
+                </button>
+                <button 
+                  onClick={() => setTaskFilter('completed')}
+                  className={cn("px-4 py-2 rounded-xl text-sm font-bold transition-all", taskFilter === 'completed' ? "bg-white shadow-sm" : "glass-card opacity-50")}
+                >
+                  完了済み
+                </button>
               </div>
 
               <div className="space-y-10">
@@ -921,7 +1166,7 @@ export default function App() {
                       <div className="w-2 h-2 rounded-full bg-brand-coral" />
                       <h4 className="text-xs font-black text-brand-indigo/40 uppercase tracking-widest">未完了</h4>
                     </div>
-                    {tasks.filter(t => t.status === 'pending').map(task => (
+                    {tasks.filter(t => (taskFilter === 'all' || taskFilter === 'pending') && t.status === 'pending' && (t.text.toLowerCase().includes(searchQuery.toLowerCase()))).map(task => (
                       <div key={task.id} className="glass-card rounded-3xl p-6 flex items-center gap-6 transition-all hover:bg-white">
                         <button 
                           onClick={() => toggleTaskStatus(task.id, task.status)}
@@ -930,16 +1175,13 @@ export default function App() {
                           <div className="w-3 h-3 rounded-sm bg-brand-coral opacity-0 group-hover:opacity-20" />
                         </button>
                         <div className="flex-1">
-                          <h3 className="font-bold text-lg text-brand-indigo">{task.task_text}</h3>
+                          <h3 className="font-bold text-lg text-brand-indigo">{task.text}</h3>
                           <div className="flex items-center gap-4 mt-2">
-                            <span className="text-xs font-mono opacity-50 flex items-center gap-1">
-                              <FileText size={12} /> {task.minute_title}
-                            </span>
                             <span className="text-xs font-mono opacity-50 flex items-center gap-1">
                               <User size={12} /> {task.assignee}
                             </span>
                             <span className="text-xs font-mono opacity-50 flex items-center gap-1">
-                              <Calendar size={12} /> {task.due_date}
+                              <Calendar size={12} /> {task.dueDate}
                             </span>
                           </div>
                         </div>
@@ -963,31 +1205,25 @@ export default function App() {
                       <div className="w-2 h-2 rounded-full bg-green-500" />
                       <h4 className="text-xs font-black text-brand-indigo/40 uppercase tracking-widest">完了済み</h4>
                     </div>
-                    {tasks.filter(t => t.status === 'completed').map(task => (
+                    {tasks.filter(t => (taskFilter === 'all' || taskFilter === 'completed') && t.status === 'completed' && (t.text.toLowerCase().includes(searchQuery.toLowerCase()))).map(task => (
                       <div key={task.id} className="glass-card rounded-3xl p-6 flex items-center gap-6 transition-all opacity-50 grayscale bg-brand-indigo/[0.02]">
                         <button 
                           onClick={() => toggleTaskStatus(task.id, task.status)}
                           className="w-8 h-8 rounded-xl bg-green-500 border-2 border-green-500 text-white flex items-center justify-center transition-all"
                         >
-                          <CheckCircle2 size={20} />
+                          <Check size={16} />
                         </button>
                         <div className="flex-1">
-                          <h3 className="font-bold text-lg line-through text-brand-indigo">{task.task_text}</h3>
+                          <h3 className="font-bold text-lg text-brand-indigo line-through">{task.text}</h3>
                           <div className="flex items-center gap-4 mt-2">
-                            <span className="text-xs font-mono opacity-50 flex items-center gap-1">
-                              <FileText size={12} /> {task.minute_title}
-                            </span>
                             <span className="text-xs font-mono opacity-50 flex items-center gap-1">
                               <User size={12} /> {task.assignee}
                             </span>
                             <span className="text-xs font-mono opacity-50 flex items-center gap-1">
-                              <Calendar size={12} /> {task.due_date}
+                              <Calendar size={12} /> {task.dueDate}
                             </span>
                           </div>
                         </div>
-                        <button className="text-brand-indigo/30 hover:text-brand-coral transition-colors">
-                          <Trash2 size={20} />
-                        </button>
                       </div>
                     ))}
                     {tasks.filter(t => t.status === 'completed').length === 0 && (
@@ -1078,9 +1314,19 @@ export default function App() {
                 >
                   <ChevronRight size={16} className="rotate-180" /> ホームに戻る
                 </button>
+                <div className="relative w-64">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-brand-indigo/30" size={16} />
+                  <input 
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="議事録を検索..."
+                    className="w-full bg-white/50 border border-brand-indigo/10 rounded-xl py-2 pl-10 pr-4 text-xs focus:outline-none focus:ring-2 focus:ring-brand-coral/50 transition-all"
+                  />
+                </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {minutes.map(minute => (
+                {handleSearch().map(minute => (
                   <div 
                     key={minute.id} 
                     onClick={() => setSelectedMinute(minute)}
@@ -1095,7 +1341,7 @@ export default function App() {
                           {minute.format}
                         </span>
                         <span className="text-[10px] font-mono opacity-40">
-                          {format(new Date(minute.created_at), 'yyyy.MM.dd')}
+                          {minute.createdAt?.toDate ? format(minute.createdAt.toDate(), 'yyyy.MM.dd') : '----.--.--'}
                         </span>
                       </div>
                       <h3 className="font-bold text-brand-indigo truncate">{minute.title}</h3>
@@ -1139,8 +1385,8 @@ export default function App() {
                       {task.status === 'completed' && <Check size={14} />}
                     </button>
                     <div className="flex-1 min-w-0">
-                      <p className={cn("text-sm font-bold text-brand-indigo truncate", task.status === 'completed' && "line-through")}>{task.task_text}</p>
-                      <p className="text-[10px] opacity-40 mt-0.5">{task.assignee} • {task.due_date} • {task.minute_title}</p>
+                      <p className={cn("text-sm font-bold text-brand-indigo truncate", task.status === 'completed' && "line-through")}>{task.text}</p>
+                      <p className="text-[10px] opacity-40 mt-0.5">{task.assignee} • {task.dueDate}</p>
                     </div>
                   </div>
                 ))}
@@ -1231,7 +1477,7 @@ export default function App() {
                     <div>
                       <h3 className="text-2xl font-black text-brand-indigo leading-tight">{selectedMinute.title}</h3>
                       <div className="flex items-center gap-4 mt-2">
-                        <span className="text-[10px] font-black opacity-30 font-mono uppercase tracking-widest">{format(new Date(selectedMinute.created_at), 'yyyy.MM.dd HH:mm')}</span>
+                        <span className="text-[10px] font-black opacity-30 font-mono uppercase tracking-widest">{selectedMinute.createdAt?.toDate ? format(selectedMinute.createdAt.toDate(), 'yyyy.MM.dd HH:mm') : '----.--.-- --:--'}</span>
                         <div className="w-1 h-1 rounded-full bg-brand-indigo/20" />
                         <span className="text-[10px] font-black text-brand-coral uppercase tracking-widest">{selectedMinute.format}</span>
                       </div>
@@ -1290,7 +1536,7 @@ export default function App() {
                           </button>
                         </div>
                         <div className="space-y-4">
-                          {tasks.filter(t => t.minute_id === selectedMinute.id).map(task => (
+                          {tasks.filter(t => t.minuteId === selectedMinute.id).map(task => (
                             <div key={task.id} className="bg-white/80 p-5 rounded-[24px] border border-white shadow-sm flex items-start gap-4 group">
                               <button 
                                 onClick={() => toggleTaskStatus(task.id, task.status)}
@@ -1303,12 +1549,12 @@ export default function App() {
                               </button>
                               <div className="flex-1 min-w-0">
                                 <span className={cn("text-sm font-bold block leading-snug", task.status === 'completed' ? "line-through opacity-30" : "text-brand-indigo")}>
-                                  {task.task_text}
+                                  {task.text}
                                 </span>
                                 <div className="flex items-center gap-2 mt-2 opacity-40 text-[10px] font-bold">
                                   <span>{task.assignee}</span>
                                   <span>•</span>
-                                  <span>{task.due_date}</span>
+                                  <span>{task.dueDate}</span>
                                 </div>
                               </div>
                             </div>
@@ -1352,7 +1598,7 @@ export default function App() {
                           <div className="h-px bg-brand-indigo/5" />
                           <div className="flex justify-between items-center">
                             <span className="text-[10px] font-black opacity-30 uppercase tracking-widest">Created</span>
-                            <span className="text-xs font-black text-brand-indigo">{format(new Date(selectedMinute.created_at), 'yyyy/MM/dd')}</span>
+                            <span className="text-xs font-black text-brand-indigo">{selectedMinute.createdAt?.toDate ? format(selectedMinute.createdAt.toDate(), 'yyyy/MM/dd') : '----/--/--'}</span>
                           </div>
                           <div className="h-px bg-brand-indigo/5" />
                           <div className="flex justify-between items-center">
