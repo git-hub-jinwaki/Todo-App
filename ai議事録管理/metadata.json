@@ -1,7 +1,0 @@
-{
-  "name": "AI議事録管理",
-  "description": "AIを活用した、和モダンデザインのプレミアム議事録作成・タスク管理システム。音声・テキスト・資料から要約とネクストアクションを自動抽出します。",
-  "requestFramePermissions": [
-    "microphone"
-  ]
-}
